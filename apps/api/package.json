@@ -1,0 +1,29 @@
+{
+  "name": "@cmd/api",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start:dev": "node --watch --require ts-node/register src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cmd/shared-types": "1.0.0",
+    "@nestjs/common": "11.1.18",
+    "@nestjs/core": "11.1.18",
+    "@nestjs/platform-express": "11.1.18",
+    "@nestjs/platform-socket.io": "11.1.18",
+    "@nestjs/websockets": "11.1.18",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "ts-node": "10.9.2",
+    "tsx": "4.19.4",
+    "typescript": "5.8.3",
+    "vitest": "3.2.4"
+  }
+}
