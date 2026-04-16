@@ -7,6 +7,7 @@
     "packages/*"
   ],
   "scripts": {
+    "dev": "node scripts/dev-all.mjs",
     "dev:web": "npm run dev -w @cmd/web",
     "dev:api": "npm run start:dev -w @cmd/api",
     "dev:worker": "npm run dev -w @cmd/worker",

@@ -11,7 +11,8 @@
 ## Quick start
 ```bash
 npm install
-npm run dev:api
-npm run dev:web
-npm run dev:worker
+npm run dev
 ```
+
+Windows 에서는 [run-dev.bat](/D:/Projects/crypto-market-dashboard/run-dev.bat) 를 더블클릭해서 실행해도 됩니다.
+종료는 [stop-dev.bat](/D:/Projects/crypto-market-dashboard/stop-dev.bat) 를 더블클릭하면 됩니다.
