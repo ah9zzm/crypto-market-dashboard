@@ -11,7 +11,7 @@ import { OnModuleDestroy } from '@nestjs/common';
 import type { AssetMarketsResponse, MarketSnapshotEvent, MarketTicker, MarketUpdateChange, MarketUpdateEvent } from '@cmd/shared-types';
 import { Namespace, Socket } from 'socket.io';
 import { BinanceLiveTickerService, type BinanceTickerUpdateEvent } from '../services/binance-live-ticker.service';
-import { MarketDiscoveryService } from '../services/market-discovery.service';
+import { type AssetIdentityHint, MarketDiscoveryService } from '../services/market-discovery.service';
 import { MarketOhlcvService } from '../services/market-ohlcv.service';
 
 interface AssetStreamState {
@@ -19,6 +19,7 @@ interface AssetStreamState {
   version: number;
   previousMarkets: Map<string, MarketTicker>;
   lastSource: AssetMarketsResponse['source'];
+  assetHint?: AssetIdentityHint;
 }
 
 @WebSocketGateway({
@@ -61,10 +62,14 @@ export class MarketGateway implements OnGatewayConnection, OnGatewayDisconnect, 
 
   @SubscribeMessage('subscribe_markets')
   async handleSubscribe(
-    @MessageBody() payload: { asset?: string },
+    @MessageBody() payload: { asset?: string; symbol?: string; name?: string },
     @ConnectedSocket() client: Socket,
   ) {
     const assetId = (payload?.asset?.trim() || 'bitcoin').toLowerCase();
+    const assetHint: AssetIdentityHint = {
+      symbol: payload?.symbol?.trim() || undefined,
+      name: payload?.name?.trim() || undefined,
+    };
     const room = this.roomName(assetId);
 
     for (const joinedRoom of client.rooms) {
@@ -76,8 +81,8 @@ export class MarketGateway implements OnGatewayConnection, OnGatewayDisconnect, 
 
     client.join(room);
     this.clientAssetMap.set(client.id, assetId);
-    const snapshot = await this.marketDiscoveryService.getMarkets(assetId);
-    this.ensureAssetStream(assetId, snapshot);
+    const snapshot = await this.marketDiscoveryService.getMarkets(assetId, assetHint, { refreshDirectTickers: true });
+    this.ensureAssetStream(assetId, snapshot, assetHint);
     this.binanceLiveTickerService.registerAssetMarkets(assetId, snapshot.markets);
     this.emitSnapshot(assetId, snapshot);
 
@@ -102,8 +107,13 @@ export class MarketGateway implements OnGatewayConnection, OnGatewayDisconnect, 
     return { event: 'unsubscribed', data: { ok: true, assetId } };
   }
 
-  private ensureAssetStream(assetId: string, initialSnapshot: AssetMarketsResponse) {
-    if (this.assetStreams.has(assetId)) {
+  private ensureAssetStream(assetId: string, initialSnapshot: AssetMarketsResponse, assetHint?: AssetIdentityHint) {
+    const existing = this.assetStreams.get(assetId);
+    if (existing) {
+      existing.assetHint = {
+        symbol: assetHint?.symbol ?? existing.assetHint?.symbol ?? initialSnapshot.asset.symbol,
+        name: assetHint?.name ?? existing.assetHint?.name ?? initialSnapshot.asset.name,
+      };
       return;
     }
 
@@ -114,6 +124,10 @@ export class MarketGateway implements OnGatewayConnection, OnGatewayDisconnect, 
       version: 1,
       previousMarkets: this.toMarketMap(initialSnapshot.markets),
       lastSource: initialSnapshot.source,
+      assetHint: {
+        symbol: assetHint?.symbol ?? initialSnapshot.asset.symbol,
+        name: assetHint?.name ?? initialSnapshot.asset.name,
+      },
     };
 
     this.assetStreams.set(assetId, initialState);
@@ -131,7 +145,7 @@ export class MarketGateway implements OnGatewayConnection, OnGatewayDisconnect, 
       return;
     }
 
-    const snapshot = await this.marketDiscoveryService.getMarkets(assetId);
+    const snapshot = await this.marketDiscoveryService.getMarkets(assetId, state.assetHint, { refreshDirectTickers: true });
     this.binanceLiveTickerService.registerAssetMarkets(assetId, snapshot.markets);
     const nextMarketMap = this.toMarketMap(snapshot.markets);
     const changes = this.diffMarkets(state.previousMarkets, nextMarketMap);

@@ -13,6 +13,12 @@ export interface CoinGeckoSearchResponse {
   coins: CoinGeckoSearchCoin[];
 }
 
+export interface CoinGeckoSimplePriceResponse {
+  [coinId: string]: {
+    usd?: number | null;
+  };
+}
+
 export interface CoinGeckoTicker {
   base?: string;
   target?: string;
@@ -60,6 +66,16 @@ export class CoinGeckoService {
   async getCoinTickers(assetId: string): Promise<CoinGeckoTickersResponse> {
     const encoded = encodeURIComponent(assetId);
     return this.getJson<CoinGeckoTickersResponse>(`/coins/${encoded}/tickers?include_exchange_logo=false&page=1`);
+  }
+
+  async getSimplePrices(assetIds: string[]): Promise<CoinGeckoSimplePriceResponse> {
+    const normalizedIds = [...new Set(assetIds.map((assetId) => assetId.trim()).filter(Boolean))];
+    if (normalizedIds.length === 0) {
+      return {};
+    }
+
+    const encodedIds = normalizedIds.map((assetId) => encodeURIComponent(assetId)).join(',');
+    return this.getJson<CoinGeckoSimplePriceResponse>(`/simple/price?ids=${encodedIds}&vs_currencies=usd`);
   }
 
   private async getJson<T>(path: string): Promise<T> {

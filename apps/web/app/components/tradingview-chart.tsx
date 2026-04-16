@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from 'react';
 import {
+  type BusinessDay,
   ColorType,
   createChart,
   CrosshairMode,
@@ -11,6 +12,7 @@ import {
   type IChartApi,
   type ISeriesApi,
   type LineData,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
 
@@ -31,9 +33,53 @@ type TradingViewSeries = {
 type TradingViewChartProps = {
   ariaLabel: string;
   chartMode: 'price' | 'premium';
-  chartTimeframe: 'tick' | '1m' | '5m' | '15m';
+  chartTimeframe: 'tick' | '1m' | '5m' | '15m' | '1h' | '4h' | '1d' | '1M';
   series: TradingViewSeries[];
 };
+
+function chartBarSpacing(chartTimeframe: TradingViewChartProps['chartTimeframe']) {
+  switch (chartTimeframe) {
+    case '1M':
+      return 56;
+    case '1d':
+      return 42;
+    case '4h':
+      return 34;
+    case '1h':
+      return 28;
+    case '15m':
+      return 24;
+    case '5m':
+      return 20;
+    case '1m':
+      return 16;
+    case 'tick':
+    default:
+      return 12;
+  }
+}
+
+function chartRightOffset(chartTimeframe: TradingViewChartProps['chartTimeframe']) {
+  switch (chartTimeframe) {
+    case '1M':
+      return 0.7;
+    case '1d':
+      return 0.9;
+    case '4h':
+      return 1;
+    case '1h':
+      return 1.05;
+    case '15m':
+      return 1.1;
+    case '5m':
+      return 1.2;
+    case '1m':
+      return 1.35;
+    case 'tick':
+    default:
+      return 1.15;
+  }
+}
 
 function normalizeLineData(points: TradingViewPoint[]) {
   const pointMap = new Map<number, number>();
@@ -50,10 +96,76 @@ function normalizeLineData(points: TradingViewPoint[]) {
     })) satisfies LineData[];
 }
 
+function browserLocale() {
+  if (typeof navigator === 'undefined') {
+    return 'en-US';
+  }
+
+  return navigator.language || 'en-US';
+}
+
+function timeToLocalDate(time: Time): Date | null {
+  if (typeof time === 'number') {
+    return new Date(time * 1000);
+  }
+
+  if (typeof time === 'string') {
+    const parsed = new Date(time);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const businessDay = time as BusinessDay;
+  return new Date(Date.UTC(businessDay.year, businessDay.month - 1, businessDay.day));
+}
+
+function formatLocalTime(time: Time, chartTimeframe: TradingViewChartProps['chartTimeframe']) {
+  const localDate = timeToLocalDate(time);
+  if (!localDate) {
+    return '';
+  }
+
+  switch (chartTimeframe) {
+    case 'tick':
+      return localDate.toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    case '1m':
+    case '5m':
+    case '15m':
+      return localDate.toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    case '1h':
+    case '4h':
+      return localDate.toLocaleString(undefined, {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    case '1d':
+      return localDate.toLocaleDateString(undefined, {
+        month: '2-digit',
+        day: '2-digit',
+      });
+    case '1M':
+      return localDate.toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: '2-digit',
+      });
+    default:
+      return localDate.toLocaleString();
+  }
+}
+
 export function TradingViewChart({ ariaLabel, chartMode, chartTimeframe, series }: TradingViewChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRefs = useRef<Map<string, ISeriesApi<'Line'>>>(new Map());
+  const lastViewportResetKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) {
@@ -93,8 +205,8 @@ export function TradingViewChart({ ariaLabel, chartMode, chartTimeframe, series 
         borderColor: 'rgba(148, 163, 184, 0.20)',
         timeVisible: true,
         secondsVisible: false,
-        rightOffset: 6,
-        barSpacing: 22,
+        rightOffset: chartRightOffset(chartTimeframe),
+        barSpacing: chartBarSpacing(chartTimeframe),
       },
       handleScroll: true,
       handleScale: true,
@@ -103,7 +215,7 @@ export function TradingViewChart({ ariaLabel, chartMode, chartTimeframe, series 
     chartRef.current = chart;
 
     const resizeObserver = new ResizeObserver(() => {
-      chart.timeScale().fitContent();
+      // autoSize handles dimensions; avoid resetting the user's zoom on resize
     });
     resizeObserver.observe(containerRef.current);
 
@@ -121,14 +233,19 @@ export function TradingViewChart({ ariaLabel, chartMode, chartTimeframe, series 
       return;
     }
 
+    const includeSeconds = chartTimeframe === 'tick';
+
     chart.applyOptions({
       localization: {
-        locale: 'ko-KR',
+        locale: browserLocale(),
+        timeFormatter: (time: Time) => formatLocalTime(time, chartTimeframe),
         priceFormatter: (value: number) => (chartMode === 'price' ? `$${value.toFixed(value >= 100 ? 2 : 4)}` : `${value >= 0 ? '+' : ''}${value.toFixed(3)}%`),
       },
       timeScale: {
-        secondsVisible: chartTimeframe === 'tick',
-        barSpacing: chartTimeframe === '15m' ? 64 : chartTimeframe === '5m' ? 34 : chartTimeframe === '1m' ? 22 : 16,
+        secondsVisible: includeSeconds,
+        rightOffset: chartRightOffset(chartTimeframe),
+        barSpacing: chartBarSpacing(chartTimeframe),
+        tickMarkFormatter: (time: Time) => formatLocalTime(time, chartTimeframe),
       },
     });
 
@@ -166,7 +283,11 @@ export function TradingViewChart({ ariaLabel, chartMode, chartTimeframe, series 
       lineSeries.setData(lineData);
     }
 
-    chart.timeScale().fitContent();
+    const viewportResetKey = `${chartMode}:${chartTimeframe}:${series.map((entry) => entry.marketId).join('|')}`;
+    if (lastViewportResetKeyRef.current !== viewportResetKey) {
+      lastViewportResetKeyRef.current = viewportResetKey;
+      chart.timeScale().fitContent();
+    }
   }, [chartMode, chartTimeframe, series]);
 
   return <div ref={containerRef} className="tradingview-chart-wrap" role="img" aria-label={ariaLabel} />;

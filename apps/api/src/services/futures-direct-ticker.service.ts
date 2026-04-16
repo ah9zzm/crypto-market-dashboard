@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { AssetDescriptor, MarketTicker, RowSource, TrustScore } from '@cmd/shared-types';
 
 interface FuturesTickerResult {
-  exchangeCode: 'binance' | 'okx' | 'bingx' | 'bybit' | 'bitget';
+  exchangeCode: 'binance' | 'okx' | 'bingx' | 'bybit' | 'bitget' | 'gate';
   exchangeName: string;
   baseAsset: string;
   quoteAsset: 'USDT';
@@ -26,6 +26,7 @@ export class FuturesDirectTickerService {
       this.fetchBingx(baseAsset),
       this.fetchBybit(baseAsset),
       this.fetchBitget(baseAsset),
+      this.fetchGate(baseAsset),
     ]);
 
     return results
@@ -56,99 +57,160 @@ export class FuturesDirectTickerService {
   }
 
   private async fetchBinance(baseAsset: string): Promise<FuturesTickerResult | null> {
-    const symbol = `${baseAsset}USDT`;
-    const payload = await this.fetchJson<any>(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`);
-    if (!payload?.symbol) return null;
-    return {
-      exchangeCode: 'binance',
-      exchangeName: 'Binance',
-      baseAsset,
-      quoteAsset: 'USDT',
-      lastPrice: this.toFiniteNumber(payload.lastPrice),
-      volume24hUsd: this.toFiniteNumber(payload.quoteVolume),
-      spreadPct: null,
-      lastTradedAt: this.toIsoString(payload.closeTime),
-      source: 'binance',
-      tradeUrl: `https://www.binance.com/en/futures/${symbol}`,
-    };
+    for (const baseCandidate of this.baseAssetCandidates(baseAsset)) {
+      const symbol = `${baseCandidate}USDT`;
+      const payload = await this.fetchJson<any>(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`);
+      if (!payload?.symbol) {
+        continue;
+      }
+
+      return {
+        exchangeCode: 'binance',
+        exchangeName: 'Binance',
+        baseAsset: baseCandidate,
+        quoteAsset: 'USDT',
+        lastPrice: this.toFiniteNumber(payload.lastPrice),
+        volume24hUsd: this.toFiniteNumber(payload.quoteVolume),
+        spreadPct: null,
+        lastTradedAt: this.toIsoString(payload.closeTime),
+        source: 'binance',
+        tradeUrl: `https://www.binance.com/en/futures/${symbol}`,
+      };
+    }
+
+    return null;
   }
 
   private async fetchBybit(baseAsset: string): Promise<FuturesTickerResult | null> {
-    const symbol = `${baseAsset}USDT`;
-    const payload = await this.fetchJson<any>(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`);
-    const data = payload?.result?.list?.[0];
-    if (!data?.symbol) return null;
-    return {
-      exchangeCode: 'bybit',
-      exchangeName: 'Bybit',
-      baseAsset,
-      quoteAsset: 'USDT',
-      lastPrice: this.toFiniteNumber(data.lastPrice),
-      volume24hUsd: this.toFiniteNumber(data.turnover24h),
-      spreadPct: this.spreadPct(data.bid1Price, data.ask1Price),
-      lastTradedAt: new Date().toISOString(),
-      source: 'bybit',
-      tradeUrl: `https://www.bybit.com/trade/usdt/${symbol}`,
-    };
+    for (const baseCandidate of this.baseAssetCandidates(baseAsset)) {
+      const symbol = `${baseCandidate}USDT`;
+      const payload = await this.fetchJson<any>(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`);
+      const data = payload?.result?.list?.[0];
+      if (!data?.symbol) {
+        continue;
+      }
+
+      return {
+        exchangeCode: 'bybit',
+        exchangeName: 'Bybit',
+        baseAsset: baseCandidate,
+        quoteAsset: 'USDT',
+        lastPrice: this.toFiniteNumber(data.lastPrice),
+        volume24hUsd: this.toFiniteNumber(data.turnover24h),
+        spreadPct: this.spreadPct(data.bid1Price, data.ask1Price),
+        lastTradedAt: new Date().toISOString(),
+        source: 'bybit',
+        tradeUrl: `https://www.bybit.com/trade/usdt/${symbol}`,
+      };
+    }
+
+    return null;
   }
 
   private async fetchOkx(baseAsset: string): Promise<FuturesTickerResult | null> {
-    const instId = `${baseAsset}-USDT-SWAP`;
-    const payload = await this.fetchJson<any>(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`);
-    const data = payload?.data?.[0];
-    if (!data?.instId) return null;
-    const lastPrice = this.toFiniteNumber(data.last);
-    const volumeBase = this.toFiniteNumber(data.volCcy24h);
-    return {
-      exchangeCode: 'okx',
-      exchangeName: 'OKX',
-      baseAsset,
-      quoteAsset: 'USDT',
-      lastPrice,
-      volume24hUsd: lastPrice !== null && volumeBase !== null ? lastPrice * volumeBase : null,
-      spreadPct: this.spreadPct(data.bidPx, data.askPx),
-      lastTradedAt: this.toIsoString(data.ts),
-      source: 'okx',
-      tradeUrl: `https://www.okx.com/trade-swap/${baseAsset.toLowerCase()}-usdt-swap`,
-    };
+    for (const baseCandidate of this.baseAssetCandidates(baseAsset)) {
+      const instId = `${baseCandidate}-USDT-SWAP`;
+      const payload = await this.fetchJson<any>(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`);
+      const data = payload?.data?.[0];
+      if (!data?.instId) {
+        continue;
+      }
+
+      const lastPrice = this.toFiniteNumber(data.last);
+      const volumeBase = this.toFiniteNumber(data.volCcy24h);
+      return {
+        exchangeCode: 'okx',
+        exchangeName: 'OKX',
+        baseAsset: baseCandidate,
+        quoteAsset: 'USDT',
+        lastPrice,
+        volume24hUsd: lastPrice !== null && volumeBase !== null ? lastPrice * volumeBase : null,
+        spreadPct: this.spreadPct(data.bidPx, data.askPx),
+        lastTradedAt: this.toIsoString(data.ts),
+        source: 'okx',
+        tradeUrl: `https://www.okx.com/trade-swap/${baseCandidate.toLowerCase()}-usdt-swap`,
+      };
+    }
+
+    return null;
   }
 
   private async fetchBitget(baseAsset: string): Promise<FuturesTickerResult | null> {
-    const symbol = `${baseAsset}USDT`;
-    const payload = await this.fetchJson<any>(`https://api.bitget.com/api/v2/mix/market/ticker?symbol=${encodeURIComponent(symbol)}&productType=USDT-FUTURES`);
-    const data = payload?.data?.[0];
-    if (!data?.symbol) return null;
-    return {
-      exchangeCode: 'bitget',
-      exchangeName: 'Bitget',
-      baseAsset,
-      quoteAsset: 'USDT',
-      lastPrice: this.toFiniteNumber(data.lastPr),
-      volume24hUsd: this.toFiniteNumber(data.usdtVolume ?? data.quoteVolume),
-      spreadPct: this.spreadPct(data.bidPr, data.askPr),
-      lastTradedAt: this.toIsoString(data.ts),
-      source: 'bitget',
-      tradeUrl: `https://www.bitget.com/futures/usdt/${symbol}`,
-    };
+    for (const baseCandidate of this.baseAssetCandidates(baseAsset)) {
+      const symbol = `${baseCandidate}USDT`;
+      const payload = await this.fetchJson<any>(`https://api.bitget.com/api/v2/mix/market/ticker?symbol=${encodeURIComponent(symbol)}&productType=USDT-FUTURES`);
+      const data = payload?.data?.[0];
+      if (!data?.symbol) {
+        continue;
+      }
+
+      return {
+        exchangeCode: 'bitget',
+        exchangeName: 'Bitget',
+        baseAsset: baseCandidate,
+        quoteAsset: 'USDT',
+        lastPrice: this.toFiniteNumber(data.lastPr),
+        volume24hUsd: this.toFiniteNumber(data.usdtVolume ?? data.quoteVolume),
+        spreadPct: this.spreadPct(data.bidPr, data.askPr),
+        lastTradedAt: this.toIsoString(data.ts),
+        source: 'bitget',
+        tradeUrl: `https://www.bitget.com/futures/usdt/${symbol}`,
+      };
+    }
+
+    return null;
   }
 
   private async fetchBingx(baseAsset: string): Promise<FuturesTickerResult | null> {
-    const symbol = `${baseAsset}-USDT`;
-    const payload = await this.fetchJson<any>(`https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}`);
-    const data = payload?.data;
-    if (!data?.symbol) return null;
-    return {
-      exchangeCode: 'bingx',
-      exchangeName: 'BingX',
-      baseAsset,
-      quoteAsset: 'USDT',
-      lastPrice: this.toFiniteNumber(data.lastPrice),
-      volume24hUsd: this.toFiniteNumber(data.quoteVolume),
-      spreadPct: this.spreadPct(data.bidPrice, data.askPrice),
-      lastTradedAt: this.toIsoString(data.closeTime),
-      source: 'bingx',
-      tradeUrl: `https://bingx.com/en-us/futures/forward/${baseAsset}USDT/`,
-    };
+    for (const baseCandidate of this.baseAssetCandidates(baseAsset)) {
+      const symbol = `${baseCandidate}-USDT`;
+      const payload = await this.fetchJson<any>(`https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}`);
+      const data = payload?.data;
+      if (!data?.symbol) {
+        continue;
+      }
+
+      return {
+        exchangeCode: 'bingx',
+        exchangeName: 'BingX',
+        baseAsset: baseCandidate,
+        quoteAsset: 'USDT',
+        lastPrice: this.toFiniteNumber(data.lastPrice),
+        volume24hUsd: this.toFiniteNumber(data.quoteVolume),
+        spreadPct: this.spreadPct(data.bidPrice, data.askPrice),
+        lastTradedAt: this.toIsoString(data.closeTime),
+        source: 'bingx',
+        tradeUrl: `https://bingx.com/en-us/futures/forward/${baseCandidate}USDT/`,
+      };
+    }
+
+    return null;
+  }
+
+  private async fetchGate(baseAsset: string): Promise<FuturesTickerResult | null> {
+    for (const baseCandidate of this.baseAssetCandidates(baseAsset)) {
+      const contract = `${baseCandidate}_USDT`;
+      const payload = await this.fetchJson<any[]>(`https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=${encodeURIComponent(contract)}`);
+      const data = Array.isArray(payload) ? payload[0] : null;
+      if (!data?.contract) {
+        continue;
+      }
+
+      return {
+        exchangeCode: 'gate',
+        exchangeName: 'Gate',
+        baseAsset: baseCandidate,
+        quoteAsset: 'USDT',
+        lastPrice: this.toFiniteNumber(data.last),
+        volume24hUsd: this.toFiniteNumber(data.volume_24h_quote ?? data.volume_24h_usdt ?? data.volume_24h),
+        spreadPct: this.spreadPct(data.highest_bid, data.lowest_ask),
+        lastTradedAt: this.toIsoString(data.update_time_ms ?? data.update_time),
+        source: 'gate',
+        tradeUrl: `https://www.gate.io/futures/USDT/${contract}`,
+      };
+    }
+
+    return null;
   }
 
   private async fetchJson<T>(url: string): Promise<T | null> {
@@ -197,6 +259,19 @@ export class FuturesDirectTickerService {
       return null;
     }
     return ((askNum - bidNum) / mid) * 100;
+  }
+
+  private baseAssetCandidates(baseAsset: string): string[] {
+    const normalized = baseAsset.toUpperCase().trim();
+    if (!normalized) {
+      return [];
+    }
+
+    if (normalized.startsWith('1000')) {
+      return [normalized];
+    }
+
+    return [normalized, `1000${normalized}`];
   }
 
   private formatUpdatedAtLabel(lastTradedAt: string | null) {

@@ -17,6 +17,7 @@ export interface AssetSearchItem {
   name: string;
   imageUrl?: string;
   marketCapRank?: number | null;
+  currentPriceUsd?: number | null;
 }
 
 export interface AssetSearchResponse {
@@ -86,7 +87,7 @@ export interface MarketUpdateEvent {
   changes: MarketUpdateChange[];
 }
 
-export type OhlcvTimeframe = 'tick' | '1m' | '5m' | '15m';
+export type OhlcvTimeframe = 'tick' | '1m' | '5m' | '15m' | '1h' | '4h' | '1d' | '1M';
 
 export interface OhlcvCandle {
   openTime: string;
@@ -112,4 +113,20 @@ export interface AssetOhlcvResponse {
   timeframe: OhlcvTimeframe;
   capturedAt: string;
   markets: MarketOhlcvSeries[];
+}
+
+export interface FundingRatePoint {
+  fundingTime: string;
+  fundingRate: number;
+}
+
+export interface AssetFundingRateResponse {
+  assetId: string;
+  symbol: string | null;
+  exchangeCode: 'binance';
+  exchangeName: 'Binance';
+  capturedAt: string;
+  currentFundingRate: number | null;
+  nextFundingTime: string | null;
+  points: FundingRatePoint[];
 }

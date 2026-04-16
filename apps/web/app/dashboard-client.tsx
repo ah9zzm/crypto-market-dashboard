@@ -1,9 +1,11 @@
-'use client';
+﻿'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
+import { FundingRateChart } from './components/funding-rate-chart';
 import { TradingViewChart } from './components/tradingview-chart';
 import type {
+  AssetFundingRateResponse,
   AssetMarketsResponse,
   AssetOhlcvResponse,
   AssetSearchItem,
@@ -27,6 +29,9 @@ const CHART_MODE_STORAGE_KEY = 'cmd:chart-mode';
 const RECENT_SEARCHES_STORAGE_KEY = 'cmd:recent-searches';
 const FAVORITE_ASSETS_STORAGE_KEY = 'cmd:favorite-assets';
 const MAX_RECENT_SEARCHES = 10;
+const FAVORITE_FUNDING_LIMIT = 8;
+const FAVORITE_FUNDING_TTL_MS = 10 * 60 * 1000;
+const SEARCH_RESULT_SUMMARY_CONCURRENCY = 2;
 
 type FetchState = 'idle' | 'loading' | 'success' | 'error';
 type LiveStatus = 'connecting' | 'live' | 'stale' | 'disconnected';
@@ -49,6 +54,28 @@ type SearchState = {
 type OhlcvState = {
   status: FetchState;
   data: AssetOhlcvResponse | null;
+  error: string | null;
+};
+
+type FundingRateState = {
+  status: FetchState;
+  data: AssetFundingRateResponse | null;
+  error: string | null;
+};
+
+type FavoriteFundingSummary = {
+  status: FetchState;
+  minFundingRate24h: number | null;
+  fetchedAt: string | null;
+  error: string | null;
+};
+
+type SearchResultMarketSummary = {
+  status: FetchState;
+  marketTypes: MarketType[];
+  instrumentTypes: InstrumentType[];
+  quotes: string[];
+  fetchedAt: string | null;
   error: string | null;
 };
 
@@ -83,10 +110,26 @@ type StoredAssetItem = {
 };
 
 const HISTORY_LIMIT = 40;
-const DEFAULT_CHART_RESET_COUNT = 10;
-const DEFAULT_EXCHANGE_LIST_COUNT = 10;
-const CHART_COLORS = ['#60a5fa', '#34d399', '#f59e0b', '#f472b6', '#a78bfa', '#22d3ee', '#fb7185', '#facc15', '#4ade80', '#c084fc'];
-const PRIORITY_EXCHANGE_CODES = ['binance', 'okx', 'bingx', 'bybit', 'bitget', 'gate'];
+const DEFAULT_CHART_RESET_COUNT = 6;
+const DEFAULT_EXCHANGE_LIST_COUNT = 6;
+const PRIORITY_EXCHANGE_CODES = ['binance', 'okx', 'bybit', 'bitget', 'bingx', 'gate'];
+const PRIORITY_EXCHANGE_LABELS: Record<string, string> = {
+  binance: 'Binance',
+  okx: 'OKX',
+  bybit: 'Bybit',
+  bitget: 'Bitget',
+  bingx: 'BingX',
+  gate: 'Gate',
+};
+const CHART_PRIORITY_COLORS: Record<string, string> = {
+  binance: '#F0B90B',
+  okx: '#FFFFFF',
+  bybit: '#F97316',
+  bitget: '#38BDF8',
+  bingx: '#2563EB',
+  gate: '#22C55E',
+};
+const CHART_FALLBACK_COLOR = '#6B7280';
 const PREFERRED_SPOT_QUOTES = ['USDT', 'USD', 'USDC', 'FDUSD', 'USD1'];
 
 function formatCurrency(value: number | null, digits = 2) {
@@ -108,6 +151,48 @@ function formatPrice(value: number | null) {
 
   const digits = value >= 100 ? 2 : value >= 1 ? 4 : 7;
   return `$${value.toFixed(digits)}`;
+}
+
+function formatSignedPercent(value: number | null, digits = 4) {
+  if (value === null) {
+    return '—';
+  }
+
+  const pct = value * 100;
+  return `${pct >= 0 ? '+' : ''}${pct.toFixed(digits)}%`;
+}
+
+function getMinFundingRate24h(data: AssetFundingRateResponse | null) {
+  if (!data) {
+    return null;
+  }
+
+  const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
+  let minimumFundingRate: number | null = null;
+
+  for (const point of data.points) {
+    const pointTimestamp = new Date(point.fundingTime).getTime();
+    if (Number.isNaN(pointTimestamp) || pointTimestamp < cutoffMs) {
+      continue;
+    }
+
+    if (minimumFundingRate === null || point.fundingRate < minimumFundingRate) {
+      minimumFundingRate = point.fundingRate;
+    }
+  }
+
+  return minimumFundingRate;
+}
+
+function summarizeSearchResultMarkets(data: AssetMarketsResponse): SearchResultMarketSummary {
+  return {
+    status: 'success',
+    marketTypes: [...new Set(data.markets.map((market) => market.marketType))],
+    instrumentTypes: [...new Set(data.markets.map((market) => market.instrumentType))],
+    quotes: [...new Set(data.markets.map((market) => market.quoteAsset))],
+    fetchedAt: data.source.fetchedAt,
+    error: null,
+  };
 }
 
 function formatCompactUsd(value: number | null) {
@@ -137,6 +222,32 @@ function calculatePremium(referencePrice: number | null, currentPrice: number | 
   }
 
   return ((currentPrice - referencePrice) / referencePrice) * 100;
+}
+
+function getMarketPriceExtremes(markets: MarketTicker[]) {
+  let lowestMarket: MarketTicker | null = null;
+  let highestMarket: MarketTicker | null = null;
+
+  for (const market of markets) {
+    if (market.lastPrice === null) {
+      continue;
+    }
+
+    if (!lowestMarket || market.lastPrice < (lowestMarket.lastPrice ?? Number.POSITIVE_INFINITY)) {
+      lowestMarket = market;
+    }
+
+    if (!highestMarket || market.lastPrice > (highestMarket.lastPrice ?? Number.NEGATIVE_INFINITY)) {
+      highestMarket = market;
+    }
+  }
+
+  return {
+    lowestMarket,
+    highestMarket,
+    lowestPrice: lowestMarket?.lastPrice ?? null,
+    highestPrice: highestMarket?.lastPrice ?? null,
+  };
 }
 
 function rowSourceLabel(source: RowSource) {
@@ -171,36 +282,38 @@ function compareVolume(left: MarketTicker | null, right: MarketTicker | null) {
 }
 
 function normalizePriorityExchangeCode(exchangeCode: string) {
-  if (exchangeCode.startsWith('bybit')) {
+  const normalized = exchangeCode.trim().toLowerCase();
+
+  if (normalized.startsWith('bybit')) {
     return 'bybit';
   }
 
-  if (exchangeCode === 'okex') {
+  if (normalized === 'okex' || normalized.startsWith('okx')) {
     return 'okx';
   }
 
-  return exchangeCode;
+  if (normalized.startsWith('binance')) {
+    return 'binance';
+  }
+
+  if (normalized.startsWith('bitget')) {
+    return 'bitget';
+  }
+
+  if (normalized.startsWith('bingx')) {
+    return 'bingx';
+  }
+
+  if (normalized.startsWith('gate')) {
+    return 'gate';
+  }
+
+  return normalized;
 }
 
-function getChartSeriesColor(exchangeCode: string, fallbackIndex: number) {
+function getChartSeriesColor(exchangeCode: string) {
   const normalized = normalizePriorityExchangeCode(exchangeCode);
-
-  switch (normalized) {
-    case 'binance':
-      return '#F0B90B';
-    case 'okx':
-      return '#FFFFFF';
-    case 'bingx':
-      return '#2563EB';
-    case 'bybit':
-      return '#F97316';
-    case 'bitget':
-      return '#38BDF8';
-    case 'gate':
-      return '#C71F37';
-    default:
-      return CHART_COLORS[fallbackIndex % CHART_COLORS.length];
-  }
+  return CHART_PRIORITY_COLORS[normalized] ?? CHART_FALLBACK_COLOR;
 }
 
 function compareMarketsBySortMode(left: MarketTicker, right: MarketTicker, sortMode: ChartSortMode) {
@@ -367,23 +480,77 @@ function formatChartTime(timestamp: number | null) {
     return '—';
   }
 
-  return new Date(timestamp).toLocaleTimeString('ko-KR', {
+  return new Date(timestamp).toLocaleTimeString(undefined, {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
   });
 }
 
-function formatChartAxisTime(timestamp: number, timeframe: ChartTimeframe) {
-  return new Date(timestamp).toLocaleTimeString('ko-KR', {
+function formatLocalDateTime(value: string | null) {
+  if (!value) {
+    return '—';
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return '—';
+  }
+
+  return parsed.toLocaleString(undefined, {
+    month: '2-digit',
+    day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
-    ...(timeframe === 'tick' ? { second: '2-digit' as const } : {}),
   });
+}
+
+function formatChartAxisTime(timestamp: number, timeframe: ChartTimeframe) {
+  const date = new Date(timestamp);
+
+  switch (timeframe) {
+    case 'tick':
+      return date.toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    case '1m':
+    case '5m':
+    case '15m':
+      return date.toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    case '1h':
+    case '4h':
+      return date.toLocaleString(undefined, {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    case '1d':
+      return date.toLocaleDateString(undefined, {
+        month: '2-digit',
+        day: '2-digit',
+      });
+    case '1M':
+      return date.toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: '2-digit',
+      });
+    default:
+      return date.toLocaleTimeString();
+  }
 }
 
 function getOhlcvCacheKey(assetId: string, timeframe: ChartTimeframe) {
   return `${assetId}:${timeframe}`;
+}
+
+function getFundingRateCacheKey(assetId: string) {
+  return assetId;
 }
 
 function getChartXAxisPosition(index: number, totalPoints: number, width: number, padding: number) {
@@ -424,6 +591,14 @@ function timeframeLabel(timeframe: ChartTimeframe) {
       return '5분봉';
     case '15m':
       return '15분봉';
+    case '1h':
+      return '1시간';
+    case '4h':
+      return '4시간';
+    case '1d':
+      return '일봉';
+    case '1M':
+      return '월봉';
     default:
       return timeframe;
   }
@@ -498,6 +673,9 @@ export function DashboardClient() {
   const [searchState, setSearchState] = useState<SearchState>({ status: 'idle', data: null, error: null });
   const [marketsState, setMarketsState] = useState<MarketsState>({ status: 'idle', data: null, error: null });
   const [ohlcvState, setOhlcvState] = useState<OhlcvState>({ status: 'idle', data: null, error: null });
+  const [fundingRateState, setFundingRateState] = useState<FundingRateState>({ status: 'idle', data: null, error: null });
+  const [favoriteFundingMap, setFavoriteFundingMap] = useState<Record<string, FavoriteFundingSummary>>({});
+  const [searchResultMarketMap, setSearchResultMarketMap] = useState<Record<string, SearchResultMarketSummary>>({});
   const [liveStatus, setLiveStatus] = useState<LiveStatus>('connecting');
   const [isBackgroundRefreshing, setIsBackgroundRefreshing] = useState(false);
   const [lastLiveUpdateAt, setLastLiveUpdateAt] = useState<string | null>(null);
@@ -505,11 +683,17 @@ export function DashboardClient() {
   const currentMarketsDataRef = useRef<AssetMarketsResponse | null>(null);
   const marketAbortRef = useRef<AbortController | null>(null);
   const ohlcvAbortRef = useRef<AbortController | null>(null);
+  const fundingRateAbortRef = useRef<AbortController | null>(null);
+  const favoriteFundingAbortRef = useRef<AbortController | null>(null);
+  const searchResultMarketAbortRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const subscribedAssetIdRef = useRef<string | null>(null);
   const storedChartSelectionsRef = useRef<Record<string, string[]>>({});
   const ohlcvCacheRef = useRef<Record<string, AssetOhlcvResponse>>({});
+  const fundingRateCacheRef = useRef<Record<string, AssetFundingRateResponse>>({});
+  const favoriteFundingMapRef = useRef<Record<string, FavoriteFundingSummary>>({});
+  const searchResultMarketMapRef = useRef<Record<string, SearchResultMarketSummary>>({});
   const chartSelectionInitializedRef = useRef(false);
   const chartSelectionSuppressedRef = useRef(false);
 
@@ -562,6 +746,9 @@ export function DashboardClient() {
     return () => {
       marketAbortRef.current?.abort();
       ohlcvAbortRef.current?.abort();
+      fundingRateAbortRef.current?.abort();
+      favoriteFundingAbortRef.current?.abort();
+      searchResultMarketAbortRef.current?.abort();
       searchAbortRef.current?.abort();
       socketRef.current?.disconnect();
     };
@@ -570,6 +757,14 @@ export function DashboardClient() {
   useEffect(() => {
     currentMarketsDataRef.current = marketsState.data;
   }, [marketsState.data]);
+
+  useEffect(() => {
+    favoriteFundingMapRef.current = favoriteFundingMap;
+  }, [favoriteFundingMap]);
+
+  useEffect(() => {
+    searchResultMarketMapRef.current = searchResultMarketMap;
+  }, [searchResultMarketMap]);
 
   useEffect(() => {
     storedChartSelectionsRef.current = storedChartSelections;
@@ -611,6 +806,8 @@ export function DashboardClient() {
 
   useEffect(() => {
     const assetId = activeAssetId;
+    const assetSymbol = selectedAsset?.id === assetId ? selectedAsset.symbol : (marketsState.data?.asset.id === assetId ? marketsState.data.asset.symbol : undefined);
+    const assetName = selectedAsset?.id === assetId ? selectedAsset.name : (marketsState.data?.asset.id === assetId ? marketsState.data.asset.name : undefined);
 
     if (!assetId) {
       return;
@@ -625,7 +822,7 @@ export function DashboardClient() {
     socket.on('connect', () => {
       setLiveStatus('live');
       subscribedAssetIdRef.current = assetId;
-      socket.emit('subscribe_markets', { asset: assetId });
+      socket.emit('subscribe_markets', { asset: assetId, symbol: assetSymbol, name: assetName });
     });
 
     socket.on('disconnect', () => {
@@ -677,7 +874,7 @@ export function DashboardClient() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [activeAssetId]);
+  }, [activeAssetId, marketsState.data?.asset.id, marketsState.data?.asset.name, marketsState.data?.asset.symbol, selectedAsset?.id, selectedAsset?.name, selectedAsset?.symbol]);
 
   useEffect(() => {
     const assetId = activeAssetId;
@@ -688,6 +885,271 @@ export function DashboardClient() {
     void loadOhlcv(assetId, chartTimeframe);
   }, [activeAssetId, chartTimeframe, lastLiveUpdateAt]);
 
+  useEffect(() => {
+    const assetId = activeAssetId;
+    const assetSymbol = selectedAsset?.id === assetId ? selectedAsset.symbol : marketsState.data?.asset.id === assetId ? marketsState.data.asset.symbol : undefined;
+    const assetName = selectedAsset?.id === assetId ? selectedAsset.name : marketsState.data?.asset.id === assetId ? marketsState.data.asset.name : undefined;
+
+    if (!assetId) {
+      return;
+    }
+
+    void loadFundingRates(assetId, { symbol: assetSymbol, name: assetName });
+  }, [activeAssetId, marketsState.data?.asset.id, marketsState.data?.asset.name, marketsState.data?.asset.symbol, selectedAsset?.id, selectedAsset?.name, selectedAsset?.symbol]);
+
+  useEffect(() => {
+    const results = searchState.data?.results ?? [];
+    if (results.length === 0) {
+      searchResultMarketAbortRef.current?.abort();
+      return;
+    }
+
+    const assetsToFetch = results.filter((asset) => {
+      const summary = searchResultMarketMapRef.current[asset.id];
+      return !summary || summary.status !== 'success';
+    });
+
+    if (assetsToFetch.length === 0) {
+      return;
+    }
+
+    searchResultMarketAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchResultMarketAbortRef.current = controller;
+
+    setSearchResultMarketMap((current) => {
+      const next = { ...current };
+
+      for (const asset of assetsToFetch) {
+        next[asset.id] = {
+          status: 'loading',
+          marketTypes: current[asset.id]?.marketTypes ?? [],
+          instrumentTypes: current[asset.id]?.instrumentTypes ?? [],
+          quotes: current[asset.id]?.quotes ?? [],
+          fetchedAt: current[asset.id]?.fetchedAt ?? null,
+          error: null,
+        };
+      }
+
+      return next;
+    });
+
+    void (async () => {
+      const queue = [...assetsToFetch];
+      const fetchedSummaries: Array<{ assetId: string; summary: SearchResultMarketSummary }> = [];
+
+      const worker = async () => {
+        while (queue.length > 0) {
+          const asset = queue.shift();
+          if (!asset) {
+            return;
+          }
+
+          const params = new URLSearchParams({
+            asset: asset.id,
+            symbol: asset.symbol,
+            name: asset.name,
+          });
+
+          try {
+            const data = await requestJson<AssetMarketsResponse>(`/markets?${params.toString()}`, controller.signal);
+            fetchedSummaries.push({
+              assetId: asset.id,
+              summary: summarizeSearchResultMarkets(data),
+            });
+          } catch (error) {
+            fetchedSummaries.push({
+              assetId: asset.id,
+              summary: {
+                status: 'error',
+                marketTypes: [] as MarketType[],
+                instrumentTypes: [] as InstrumentType[],
+                quotes: [] as string[],
+                fetchedAt: new Date().toISOString(),
+                error: error instanceof Error ? error.message : '마켓 요약을 불러오지 못했습니다.',
+              } satisfies SearchResultMarketSummary,
+            });
+          }
+        }
+      };
+
+      await Promise.all(
+        Array.from(
+          { length: Math.min(SEARCH_RESULT_SUMMARY_CONCURRENCY, assetsToFetch.length) },
+          () => worker(),
+        ),
+      );
+
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      setSearchResultMarketMap((current) => {
+        const next = { ...current };
+
+        for (const item of fetchedSummaries) {
+          next[item.assetId] = item.summary;
+        }
+
+        return next;
+      });
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [searchState.data?.results]);
+
+  useEffect(() => {
+    if (!activeAssetId || !fundingRateState.data || !favoriteAssets.some((asset) => asset.id === activeAssetId)) {
+      return;
+    }
+
+    const minFundingRate24h = getMinFundingRate24h(fundingRateState.data);
+    setFavoriteFundingMap((current) => ({
+      ...current,
+      [activeAssetId]: {
+        status: 'success',
+        minFundingRate24h,
+        fetchedAt: fundingRateState.data?.capturedAt ?? new Date().toISOString(),
+        error: null,
+      },
+    }));
+  }, [activeAssetId, favoriteAssets, fundingRateState.data]);
+
+  useEffect(() => {
+    if (favoriteAssets.length === 0) {
+      favoriteFundingAbortRef.current?.abort();
+      return;
+    }
+
+    const now = Date.now();
+    const cachedSummaries: Array<{ assetId: string; summary: FavoriteFundingSummary }> = [];
+    const assetsToFetch: StoredAssetItem[] = [];
+
+    for (const asset of favoriteAssets) {
+      const cachedFunding = fundingRateCacheRef.current[asset.id];
+      const cachedFundingAgeMs = cachedFunding ? now - new Date(cachedFunding.capturedAt).getTime() : Number.POSITIVE_INFINITY;
+
+      if (cachedFunding && Number.isFinite(cachedFundingAgeMs) && cachedFundingAgeMs <= FAVORITE_FUNDING_TTL_MS) {
+        cachedSummaries.push({
+          assetId: asset.id,
+          summary: {
+            status: 'success',
+            minFundingRate24h: getMinFundingRate24h(cachedFunding),
+            fetchedAt: cachedFunding.capturedAt,
+            error: null,
+          },
+        });
+        continue;
+      }
+
+      const currentSummary = favoriteFundingMapRef.current[asset.id];
+      const summaryAgeMs = currentSummary?.fetchedAt ? now - new Date(currentSummary.fetchedAt).getTime() : Number.POSITIVE_INFINITY;
+      const isFreshSummary = currentSummary?.fetchedAt && Number.isFinite(summaryAgeMs) && summaryAgeMs <= FAVORITE_FUNDING_TTL_MS;
+
+      if (!isFreshSummary) {
+        assetsToFetch.push(asset);
+      }
+    }
+
+    if (cachedSummaries.length > 0) {
+      setFavoriteFundingMap((current) => {
+        const next = { ...current };
+        for (const entry of cachedSummaries) {
+          next[entry.assetId] = entry.summary;
+        }
+        return next;
+      });
+    }
+
+    if (assetsToFetch.length === 0) {
+      return;
+    }
+
+    favoriteFundingAbortRef.current?.abort();
+    const controller = new AbortController();
+    favoriteFundingAbortRef.current = controller;
+
+    setFavoriteFundingMap((current) => {
+      const next = { ...current };
+
+      for (const asset of assetsToFetch) {
+        const previous = current[asset.id];
+        next[asset.id] = {
+          status: 'loading',
+          minFundingRate24h: previous?.minFundingRate24h ?? null,
+          fetchedAt: previous?.fetchedAt ?? null,
+          error: null,
+        };
+      }
+
+      return next;
+    });
+
+    void (async () => {
+      const results = await Promise.all(
+        assetsToFetch.map(async (asset) => {
+          const params = new URLSearchParams({
+            asset: asset.id,
+            symbol: asset.symbol,
+            name: asset.name,
+            limit: String(FAVORITE_FUNDING_LIMIT),
+          });
+
+          try {
+            const data = await requestJson<AssetFundingRateResponse>(`/markets/funding?${params.toString()}`, controller.signal);
+            return {
+              assetId: asset.id,
+              data,
+              error: null,
+            };
+          } catch (error) {
+            return {
+              assetId: asset.id,
+              data: null,
+              error: error instanceof Error ? error.message : '펀딩비 데이터를 불러오지 못했습니다.',
+            };
+          }
+        }),
+      );
+
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      setFavoriteFundingMap((current) => {
+        const next = { ...current };
+
+        for (const result of results) {
+          if (result.data) {
+            fundingRateCacheRef.current[result.assetId] = result.data;
+            next[result.assetId] = {
+              status: 'success',
+              minFundingRate24h: getMinFundingRate24h(result.data),
+              fetchedAt: result.data.capturedAt,
+              error: null,
+            };
+            continue;
+          }
+
+          next[result.assetId] = {
+            status: 'error',
+            minFundingRate24h: current[result.assetId]?.minFundingRate24h ?? null,
+            fetchedAt: current[result.assetId]?.fetchedAt ?? new Date().toISOString(),
+            error: result.error,
+          };
+        }
+
+        return next;
+      });
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [favoriteAssets]);
+
   async function loadOhlcv(assetId: string, timeframe: ChartTimeframe) {
     ohlcvAbortRef.current?.abort();
     const controller = new AbortController();
@@ -695,10 +1157,14 @@ export function DashboardClient() {
     const cacheKey = getOhlcvCacheKey(assetId, timeframe);
     const cached = ohlcvCacheRef.current[cacheKey] ?? null;
 
-    setOhlcvState({
-      status: cached ? 'success' : 'loading',
-      data: cached,
-      error: null,
+    setOhlcvState((current) => {
+      const preservedData = current.data?.assetId === assetId ? current.data : null;
+
+      return {
+        status: cached || preservedData ? 'success' : 'loading',
+        data: cached ?? preservedData,
+        error: null,
+      };
     });
 
     try {
@@ -726,6 +1192,48 @@ export function DashboardClient() {
     }
   }
 
+  async function loadFundingRates(assetId: string, assetMeta?: { symbol?: string; name?: string }) {
+    fundingRateAbortRef.current?.abort();
+    const controller = new AbortController();
+    fundingRateAbortRef.current = controller;
+    const cacheKey = getFundingRateCacheKey(assetId);
+    const cached = fundingRateCacheRef.current[cacheKey] ?? null;
+
+    setFundingRateState({
+      status: cached ? 'success' : 'loading',
+      data: cached,
+      error: null,
+    });
+
+    try {
+      const params = new URLSearchParams({ asset: assetId, limit: '90' });
+      if (assetMeta?.symbol) {
+        params.set('symbol', assetMeta.symbol);
+      }
+      if (assetMeta?.name) {
+        params.set('name', assetMeta.name);
+      }
+
+      const data = await requestJson<AssetFundingRateResponse>(`/markets/funding?${params.toString()}`, controller.signal);
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      fundingRateCacheRef.current[cacheKey] = data;
+      setFundingRateState({ status: 'success', data, error: null });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      setFundingRateState((current) => ({
+        status: current.data ? 'success' : 'error',
+        data: current.data,
+        error: error instanceof Error ? error.message : '펀딩비 데이터를 불러오지 못했습니다.',
+      }));
+    }
+  }
+
   async function loadMarkets(assetId: string, assetMeta?: AssetSearchItem, options?: { trackRecent?: boolean }) {
     marketAbortRef.current?.abort();
     const controller = new AbortController();
@@ -740,7 +1248,15 @@ export function DashboardClient() {
     setIsBackgroundRefreshing(Boolean(currentMarketsDataRef.current));
 
     try {
-      const data = await requestJson<AssetMarketsResponse>(`/markets?asset=${encodeURIComponent(assetId)}`, controller.signal);
+      const params = new URLSearchParams({ asset: assetId });
+      if (assetMeta?.symbol) {
+        params.set('symbol', assetMeta.symbol);
+      }
+      if (assetMeta?.name) {
+        params.set('name', assetMeta.name);
+      }
+
+      const data = await requestJson<AssetMarketsResponse>(`/markets?${params.toString()}`, controller.signal);
 
       if (requestId !== marketRequestIdRef.current) {
         return;
@@ -861,8 +1377,8 @@ export function DashboardClient() {
     event.preventDefault();
     const trimmed = query.trim();
 
-    if (trimmed.length < 2) {
-      setSearchState({ status: 'error', data: null, error: '검색어는 2글자 이상 입력해주세요.' });
+    if (trimmed.length < 1) {
+      setSearchState({ status: 'error', data: null, error: '검색어를 입력해주세요.' });
       return;
     }
 
@@ -909,6 +1425,37 @@ export function DashboardClient() {
     return ['ALL', ...new Set((marketsState.data?.markets ?? []).map((row) => row.quoteAsset))];
   }, [marketsState.data]);
 
+  const filteredSearchResults = useMemo(() => {
+    const results = searchState.data?.results ?? [];
+    const hasSearchMarketFilter = marketTypeFilter !== 'ALL' || instrumentTypeFilter !== 'ALL' || quoteFilter !== 'ALL';
+
+    return results.filter((asset) => {
+      const summary = searchResultMarketMap[asset.id];
+
+      if (!hasSearchMarketFilter) {
+        return true;
+      }
+
+      if (!summary || summary.status !== 'success') {
+        return false;
+      }
+
+      const marketTypeMatch = marketTypeFilter === 'ALL' || summary.marketTypes.includes(marketTypeFilter);
+      const instrumentTypeMatch = instrumentTypeFilter === 'ALL' || summary.instrumentTypes.includes(instrumentTypeFilter);
+      const quoteMatch = quoteFilter === 'ALL' || summary.quotes.includes(quoteFilter);
+
+      return marketTypeMatch && instrumentTypeMatch && quoteMatch;
+    });
+  }, [instrumentTypeFilter, marketTypeFilter, quoteFilter, searchResultMarketMap, searchState.data?.results]);
+
+  const pendingSearchResultCount = useMemo(() => {
+    const results = searchState.data?.results ?? [];
+    return results.filter((asset) => {
+      const summary = searchResultMarketMap[asset.id];
+      return !summary || summary.status === 'loading';
+    }).length;
+  }, [searchResultMarketMap, searchState.data?.results]);
+
   const exchangeMarketGroups = useMemo(() => {
     const grouped = new Map<string, ExchangeMarketGroup>();
 
@@ -931,6 +1478,20 @@ export function DashboardClient() {
       }
 
       grouped.set(normalizedExchangeCode, existing);
+    }
+
+    for (const priorityExchangeCode of PRIORITY_EXCHANGE_CODES) {
+      if (grouped.has(priorityExchangeCode)) {
+        continue;
+      }
+
+      grouped.set(priorityExchangeCode, {
+        exchangeCode: priorityExchangeCode,
+        exchangeName: PRIORITY_EXCHANGE_LABELS[priorityExchangeCode] ?? priorityExchangeCode.toUpperCase(),
+        marketType: 'CEX',
+        spot: null,
+        futures: null,
+      });
     }
 
     return [...grouped.values()].sort((left, right) => compareExchangeGroupsBySortMode(left, right, chartSortMode));
@@ -994,16 +1555,19 @@ export function DashboardClient() {
 
   const directSourceCount = sourceCounts.binance + sourceCounts.kucoin + sourceCounts.gate + sourceCounts.mexc + sourceCounts.bybit + sourceCounts.okx + sourceCounts.bingx + sourceCounts.bitget;
 
-  const referencePrice = sortedVisibleMarkets[0]?.lastPrice ?? null;
+  const marketPriceExtremes = useMemo(() => getMarketPriceExtremes(sortedVisibleMarkets), [sortedVisibleMarkets]);
+  const lowestVisiblePrice = marketPriceExtremes.lowestPrice;
+  const highestVisiblePrice = marketPriceExtremes.highestPrice;
+  const visibleMarketRangePct = calculatePremium(lowestVisiblePrice, highestVisiblePrice);
   const staleBanner = marketsState.data?.source.degraded ? 'CoinGecko 응답이 불안정해 캐시 또는 축소된 데이터를 표시 중입니다.' : null;
-  const staleLabel = marketsState.data ? `${marketsState.data.source.cache.toUpperCase()} · ${new Date(marketsState.data.source.fetchedAt).toLocaleString('ko-KR')}` : null;
-  const liveLabel = `${liveStatusLabel(liveStatus)}${lastLiveUpdateAt ? ` · ${new Date(lastLiveUpdateAt).toLocaleTimeString('ko-KR')}` : ''}`;
+  const staleLabel = marketsState.data ? `${marketsState.data.source.cache.toUpperCase()} · ${new Date(marketsState.data.source.fetchedAt).toLocaleString()}` : null;
+  const liveLabel = `${liveStatusLabel(liveStatus)}${lastLiveUpdateAt ? ` · ${new Date(lastLiveUpdateAt).toLocaleTimeString()}` : ''}`;
 
   const comparisonSeries = useMemo(() => {
     const ohlcvMarketMap = new Map((ohlcvState.data?.markets ?? []).map((market) => [market.marketId, market]));
 
     return selectedChartMarkets
-      .map((row, index) => {
+      .map((row) => {
         const marketSeries = ohlcvMarketMap.get(row.marketId);
         if (!marketSeries) {
           return null;
@@ -1021,7 +1585,7 @@ export function DashboardClient() {
             timestamp: new Date(candle.openTime).getTime(),
             price: candle.close,
           })),
-          color: getChartSeriesColor(row.exchangeCode, index),
+          color: getChartSeriesColor(row.exchangeCode),
         };
       })
       .filter((series): series is PriceHistorySeries & { color: string } => Boolean(series))
@@ -1096,20 +1660,32 @@ export function DashboardClient() {
   }, [comparisonSeries]);
 
   const premiumSeries = useMemo(() => {
-    const referenceSeries = comparisonSeries[0];
-    if (!referenceSeries) {
-      return [] as Array<PriceHistorySeries & { color: string }>;
+    const timestampRanges = new Map<number, { low: number; high: number }>();
+
+    for (const series of comparisonSeries) {
+      for (const point of series.points) {
+        const existing = timestampRanges.get(point.timestamp);
+        if (!existing) {
+          timestampRanges.set(point.timestamp, { low: point.price, high: point.price });
+          continue;
+        }
+
+        existing.low = Math.min(existing.low, point.price);
+        existing.high = Math.max(existing.high, point.price);
+      }
     }
 
-    const referenceMap = new Map(referenceSeries.points.map((point) => [point.timestamp, point.price]));
+    if (timestampRanges.size === 0) {
+      return [] as Array<PriceHistorySeries & { color: string }>;
+    }
 
     return comparisonSeries
       .map((series) => ({
         ...series,
         points: series.points
           .map((point) => {
-            const referencePoint = referenceMap.get(point.timestamp);
-            const premium = calculatePremium(referencePoint ?? null, point.price);
+            const range = timestampRanges.get(point.timestamp);
+            const premium = calculatePremium(range?.low ?? null, point.price);
             return premium === null
               ? null
               : {
@@ -1142,11 +1718,17 @@ export function DashboardClient() {
     };
   }, [premiumSeries]);
 
-  const referenceExchangeName = sortedVisibleMarkets[0]?.exchangeName ?? '기준 거래소';
   const activeSeries = chartMode === 'price' ? comparisonSeries : premiumSeries;
   const activeChartMetrics = chartMode === 'price' ? chartMetrics : premiumChartMetrics;
   const activeYAxisFormatter = (value: number) => (chartMode === 'price' ? formatPrice(value) : `${value >= 0 ? '+' : ''}${value.toFixed(3)}%`);
-  const chartHeading = chartMode === 'price' ? '거래소별 가격 비교 차트' : '기준 거래소 대비 괴리율 차트';
+  const chartHeading = chartMode === 'price' ? '거래소별 가격 비교 차트' : '전체 시장 최저가 대비 괴리율 차트';
+  const fundingRateChartPoints = useMemo(() => {
+    return (fundingRateState.data?.points ?? []).map((point) => ({
+      timestamp: new Date(point.fundingTime).getTime(),
+      fundingRate: point.fundingRate,
+    }));
+  }, [fundingRateState.data?.points]);
+  const latestFundingRate = fundingRateState.data?.points.at(-1)?.fundingRate ?? fundingRateState.data?.currentFundingRate ?? null;
   const isSelectedAssetFavorite = selectedAsset ? favoriteAssets.some((asset) => asset.id === selectedAsset.id) : false;
 
   return (
@@ -1192,21 +1774,36 @@ export function DashboardClient() {
         {searchState.status === 'success' && searchState.data?.results.length === 0 ? (
           <p className="muted" style={{ marginTop: 16 }}>검색 결과가 없습니다. 다른 심볼이나 이름으로 다시 시도해주세요.</p>
         ) : null}
+        {searchState.status === 'success' && (searchState.data?.results.length ?? 0) > 0 && filteredSearchResults.length === 0 ? (
+          <p className="muted" style={{ marginTop: 16 }}>
+            {pendingSearchResultCount > 0 ? '검색 결과의 마켓 조건을 확인 중입니다.' : '현재 필터 조건에 맞는 검색 결과가 없습니다.'}
+          </p>
+        ) : null}
 
-        {searchState.data?.results?.length ? (
+        {filteredSearchResults.length ? (
           <div className="results-list">
-            {searchState.data.results.map((asset) => (
-              <button
-                key={asset.id}
-                type="button"
-                className={`result-chip result-chip-compact ${selectedAsset?.id === asset.id ? 'result-chip-active' : ''}`}
-                onClick={() => void selectAsset(asset, { trackRecent: true })}
-                title={`${asset.symbol} · ${asset.name}`}
-              >
-                <span className="result-chip-symbol">{asset.symbol}</span>
-                <small className="result-chip-name">{asset.name}</small>
-              </button>
-            ))}
+            {filteredSearchResults.map((asset) => {
+              const summary = searchResultMarketMap[asset.id];
+
+              return (
+                <button
+                  key={asset.id}
+                  type="button"
+                  className={`result-chip result-chip-compact ${selectedAsset?.id === asset.id ? 'result-chip-active' : ''}`}
+                  onClick={() => void selectAsset(asset, { trackRecent: true })}
+                  title={`${asset.symbol} · ${asset.name}`}
+                >
+                  <span className="result-chip-symbol">{asset.symbol}</span>
+                  <small className="result-chip-name">{asset.name}</small>
+                  <small className="result-chip-price">{formatPrice(asset.currentPriceUsd ?? null)}</small>
+                  <div className="result-chip-badges">
+                    {summary?.marketTypes.includes('CEX') ? <span className="market-chip market-chip-cex">CEX</span> : null}
+                    {summary?.marketTypes.includes('DEX') ? <span className="market-chip market-chip-dex">DEX</span> : null}
+                    {summary?.status === 'loading' && summary.marketTypes.length === 0 ? <span className="market-chip">확인중</span> : null}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         ) : null}
 
@@ -1237,38 +1834,53 @@ export function DashboardClient() {
           <span className="quick-access-mini-label quick-access-mini-label-favorite" title="자주 보는 티커를 고정해두고 순서를 직접 바꿀 수 있습니다.">★</span>
           <div className="quick-access-chips quick-access-chips-favorites">
             {favoriteAssets.length > 0 ? (
-              favoriteAssets.map((asset) => (
-                <div
-                  key={`favorite-${asset.id}`}
-                  className={`favorite-chip-wrap ${draggedFavoriteId === asset.id ? 'favorite-chip-wrap-dragging' : ''} ${favoriteDropTargetId === asset.id ? 'favorite-chip-wrap-drop-target' : ''}`}
-                  draggable
-                  onDragStart={(event) => {
-                    event.dataTransfer.effectAllowed = 'move';
-                    event.dataTransfer.setData('text/plain', asset.id);
-                    handleFavoriteDragStart(asset.id);
-                  }}
-                  onDragEnter={() => handleFavoriteDragEnter(asset.id)}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    event.dataTransfer.dropEffect = 'move';
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    handleFavoriteDrop(asset.id);
-                  }}
-                  onDragEnd={handleFavoriteDragEnd}
-                  title={`${asset.name} · 드래그해서 순서 변경`}
-                >
-                  <button
-                    type="button"
-                    className={`quick-asset-chip quick-asset-chip-favorite ${selectedAsset?.id === asset.id ? 'quick-asset-chip-active' : ''}`}
-                    onClick={() => void selectAsset(asset, { trackRecent: true })}
-                    title={asset.name}
+              favoriteAssets.map((asset) => {
+                const fundingSummary = favoriteFundingMap[asset.id];
+                const fundingLabel =
+                  fundingSummary?.status === 'loading' && fundingSummary.fetchedAt === null
+                    ? '24h 저펀딩 로딩중'
+                    : `24h 저펀딩 ${formatSignedPercent(fundingSummary?.minFundingRate24h ?? null)}`;
+                const fundingToneClass =
+                  fundingSummary?.minFundingRate24h == null
+                    ? ''
+                    : (fundingSummary.minFundingRate24h ?? 0) < 0
+                      ? 'favorite-funding-label-negative'
+                      : 'favorite-funding-label-positive';
+
+                return (
+                  <div
+                    key={`favorite-${asset.id}`}
+                    className={`favorite-chip-wrap ${draggedFavoriteId === asset.id ? 'favorite-chip-wrap-dragging' : ''} ${favoriteDropTargetId === asset.id ? 'favorite-chip-wrap-drop-target' : ''}`}
+                    draggable
+                    onDragStart={(event) => {
+                      event.dataTransfer.effectAllowed = 'move';
+                      event.dataTransfer.setData('text/plain', asset.id);
+                      handleFavoriteDragStart(asset.id);
+                    }}
+                    onDragEnter={() => handleFavoriteDragEnter(asset.id)}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = 'move';
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      handleFavoriteDrop(asset.id);
+                    }}
+                    onDragEnd={handleFavoriteDragEnd}
+                    title={`${asset.name} · 드래그해서 순서 변경`}
                   >
-                    <span>{asset.symbol}</span>
-                  </button>
-                </div>
-              ))
+                    <button
+                      type="button"
+                      className={`quick-asset-chip quick-asset-chip-favorite ${selectedAsset?.id === asset.id ? 'quick-asset-chip-active' : ''}`}
+                      onClick={() => void selectAsset(asset, { trackRecent: true })}
+                      title={asset.name}
+                    >
+                      <span className="quick-asset-chip-symbol">{asset.symbol}</span>
+                      <small className={`favorite-funding-label ${fundingToneClass}`}>{fundingLabel}</small>
+                    </button>
+                  </div>
+                );
+              })
             ) : (
               <span className="muted">없음</span>
             )}
@@ -1374,7 +1986,7 @@ export function DashboardClient() {
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
               <div className="chart-top-controls">
                 <div className="timeframe-toggle" role="tablist" aria-label="차트 프레임 옵션">
-                  {(['tick', '1m', '5m', '15m'] as ChartTimeframe[]).map((timeframe) => (
+                  {(['tick', '1m', '5m', '15m', '1h', '4h', '1d', '1M'] as ChartTimeframe[]).map((timeframe) => (
                     <button
                       key={timeframe}
                       type="button"
@@ -1400,6 +2012,33 @@ export function DashboardClient() {
             {activeSeries.length > 0 && activeChartMetrics ? (
               <>
                 <TradingViewChart ariaLabel={chartHeading} chartMode={chartMode} chartTimeframe={chartTimeframe} series={activeSeries} />
+
+                <div className="funding-subchart-panel">
+                  <div className="funding-subchart-header">
+                    <div>
+                      <strong>Binance 펀딩비</strong>
+                      <div className="muted" style={{ marginTop: 6 }}>
+                        {(fundingRateState.data?.symbol ?? 'USDT Perpetual')} · 최근 {fundingRateChartPoints.length}회
+                      </div>
+                    </div>
+                    <div className="funding-subchart-badges">
+                      <span className="badge badge-compact">최근 {formatSignedPercent(latestFundingRate)}</span>
+                      <span className="badge badge-compact">다음 정산 {formatLocalDateTime(fundingRateState.data?.nextFundingTime ?? null)}</span>
+                    </div>
+                  </div>
+
+                  {fundingRateChartPoints.length > 0 ? (
+                    <FundingRateChart ariaLabel="Binance 선물 펀딩비 보조차트" points={fundingRateChartPoints} />
+                  ) : (
+                    <div className="chart-placeholder chart-placeholder-compact funding-subchart-placeholder">
+                      {fundingRateState.status === 'loading'
+                        ? 'Binance 선물 펀딩비를 불러오는 중입니다.'
+                        : fundingRateState.error
+                          ? `펀딩비 로딩 실패: ${fundingRateState.error}`
+                          : '이 자산은 Binance USDT 무기한 선물 펀딩 히스토리를 아직 찾지 못했습니다.'}
+                    </div>
+                  )}
+                </div>
 
                 <div className="chart-legend">
                   {activeSeries.map((series) => (
@@ -1439,6 +2078,11 @@ export function DashboardClient() {
             <p className="muted" style={{ marginTop: 8 }}>
               상세 테이블은 필요할 때만 펼쳐서 확인합니다. 기본 화면은 차트 비교에 집중합니다.
             </p>
+            {lowestVisiblePrice !== null && highestVisiblePrice !== null ? (
+              <p className="muted" style={{ marginTop: 8 }}>
+                최저 {marketPriceExtremes.lowestMarket?.exchangeName} {marketPriceExtremes.lowestMarket?.instrumentType === 'spot' ? 'S' : 'F'} {formatPrice(lowestVisiblePrice)} · 최고 {marketPriceExtremes.highestMarket?.exchangeName} {marketPriceExtremes.highestMarket?.instrumentType === 'spot' ? 'S' : 'F'} {formatPrice(highestVisiblePrice)} · 전체 범위 {visibleMarketRangePct === null ? '—' : `+${visibleMarketRangePct.toFixed(3)}%`}
+              </p>
+            ) : null}
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <span className="badge">{visibleMarkets.length}개 표시</span>
@@ -1459,7 +2103,8 @@ export function DashboardClient() {
                 <th>시장</th>
                 <th>쌍</th>
                 <th>시세</th>
-                <th>기준 대비</th>
+                <th>최저가 대비</th>
+                <th>최고가 대비</th>
                 <th>스프레드</th>
                 <th>24시간 거래량</th>
                 <th>신뢰도</th>
@@ -1470,12 +2115,13 @@ export function DashboardClient() {
               {marketsState.status === 'loading' && !marketsState.data ? (
                 Array.from({ length: 5 }).map((_, index) => (
                   <tr key={`skeleton-${index}`}>
-                    <td colSpan={10} className="muted">마켓 데이터를 불러오는 중입니다...</td>
+                    <td colSpan={11} className="muted">마켓 데이터를 불러오는 중입니다...</td>
                   </tr>
                 ))
               ) : visibleMarkets.length > 0 ? (
                 visibleMarkets.map((row) => {
-                  const premium = calculatePremium(referencePrice, row.lastPrice);
+                  const lowGap = calculatePremium(lowestVisiblePrice, row.lastPrice);
+                  const highGap = calculatePremium(highestVisiblePrice, row.lastPrice);
                   return (
                     <tr key={row.marketId}>
                       <td>{row.rank}</td>
@@ -1500,8 +2146,11 @@ export function DashboardClient() {
                         ) : null}
                       </td>
                       <td>{formatPrice(row.lastPrice)}</td>
-                      <td className={premium === null ? 'muted' : premium >= 0 ? 'price-up' : 'price-down'}>
-                        {premium === null ? '—' : `${premium >= 0 ? '+' : ''}${premium.toFixed(3)}%`}
+                      <td className={lowGap === null ? 'muted' : lowGap >= 0 ? 'price-up' : 'price-down'}>
+                        {lowGap === null ? '—' : `${lowGap >= 0 ? '+' : ''}${lowGap.toFixed(3)}%`}
+                      </td>
+                      <td className={highGap === null ? 'muted' : highGap >= 0 ? 'price-up' : 'price-down'}>
+                        {highGap === null ? '—' : `${highGap >= 0 ? '+' : ''}${highGap.toFixed(3)}%`}
                       </td>
                       <td>{row.spreadPct === null ? '—' : `${row.spreadPct.toFixed(3)}%`}</td>
                       <td>{formatCurrency(row.volume24hUsd, 0)}</td>
@@ -1512,7 +2161,7 @@ export function DashboardClient() {
                 })
               ) : (
                 <tr>
-                  <td colSpan={10} className="muted">현재 조건에 맞는 마켓이 없습니다.</td>
+                  <td colSpan={11} className="muted">현재 조건에 맞는 마켓이 없습니다.</td>
                 </tr>
               )}
             </tbody>
